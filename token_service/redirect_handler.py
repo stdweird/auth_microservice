@@ -1,8 +1,9 @@
-import requests
-import json
-import datetime
 import base64
+import datetime
+import json
 import jwt
+import logging
+import requests
 try:
     from urllib.parse import quote
 except ImportError:
@@ -52,8 +53,8 @@ class RedirectHandler(object):
                     via an OpenID provider, this must include 'openid'.
         provider_tag: matched against provider dictionary keys in the configuration loaded at startup
         '''
-        print('adding callback waiter with uid {}, scopes {}, provider {}, return_to {}'.format(
-                uid, scopes, provider_tag, return_to))
+        logging.debug('adding callback waiter with uid %s, scopes %s, provider %s, return_to %s',
+                      uid, scopes, provider_tag, return_to)
         scopes = sorted(scopes)
         if uid is None:
             uid = ''
@@ -118,8 +119,9 @@ class RedirectHandler(object):
         if not w:
             return HttpResponseBadRequest('callback request from login is malformed, or authorization session expired')
         else:
-            print('accepted request maps to pending callback object: ' + str(vars(w)))
+            logging.debug('accepted request maps to pending callback object: %s', vars(w))
             if now() > w.creation_time + datetime.timedelta(seconds=Config['url_expiration_timeout']):
+                logging.warn('authorization url has expired object: %s', vars(w))
                 return HttpResponseBadRequest('This authorization url has expired, please retry')
             provider = w.provider
             if self.is_openid(provider):
@@ -168,7 +170,7 @@ class RedirectHandler(object):
         access_token = body['access_token']
         expires_in = body['expires_in']
         refresh_token = body['refresh_token']
-        print('token_response:\n' + str(body))
+        self.debug('token_response: %s', body)
         # convert expires_in to timestamp
         expire_time = now() + datetime.timedelta(seconds=expires_in)
         # expire_time = expire_time.replace(tzinfo=datetime.timezone.utc)
@@ -176,7 +178,7 @@ class RedirectHandler(object):
         # expand the id_token to the encoded json object
         # TODO signature validation if signature provided
         id_token = jwt.decode(id_token, verify=False)
-        print('id_token body:\n' + str(id_token))
+        self.debug('id_token: %s', id_token)
 
         sub = id_token['sub']
         issuer = id_token['iss']
@@ -187,7 +189,7 @@ class RedirectHandler(object):
         # check if user exists
         users = models.User.objects.filter(id=sub)
         if len(users) == 0:
-            print('creating new user with id: {}'.format(sub))
+            logging.info('creating new user with id: %s', sub)
             # try to fill username with email
             if 'preferred_username' in id_token:
                 user_name = id_token['preferred_username']
@@ -195,8 +197,8 @@ class RedirectHandler(object):
                 user_name = id_token['email']
             else:
                 user_name = ''
-                print(('no email or username received for unrecognized user callback, ',
-                       'filling user_name with blank string'))
+                logging.warn(('no email or username received for unrecognized user callback, ',
+                              'filling user_name with blank string'))
             if 'name' in id_token:
                 name = id_token['name']
             else:
@@ -207,7 +209,7 @@ class RedirectHandler(object):
                 name=name)
             user.save()
         else:
-            print('user recognized with id: {}'.format(sub))
+            logging.info('user recognized with id: %s', sub)
             user = users[0]
         act_hash = sha256(access_token)
         token = models.Token(
@@ -233,7 +235,7 @@ class RedirectHandler(object):
         return (True, '', user, token, nonce)
 
     def validate_token(self, provider, access_token, scopes=None):
-        print('validate_token, provider: [{}], access_token: [{}]'.format(provider, access_token))
+        logging.debug('validate_token: provider: %s, access_token: %s', provider, access_token)
         headers = {
             'Authorization': 'Bearer ' + str(access_token)
         }
@@ -294,7 +296,7 @@ class RedirectHandler(object):
         elif self.is_oauth2(token_model.provider):
             token_endpoint = provider_config['token_endpoint']
         else:
-            raise RuntimeError('could not refresh unrecognized provider standard')
+            raise RuntimeError('could not refresh unrecognized provider standard {}'.format(token_model.provider))
 
         data = {
             'grant_type': 'refresh_token',
@@ -368,8 +370,8 @@ class RedirectHandler(object):
             # not cached, or cached entry is more than 1 day old
             response = requests.get(meta_url)
             if response.status_code != 200:
-                raise RuntimeError('could not retrieve openid metadata, returned error: '
-                                   + str(response.status_code) + '\n' + response.content.decode('utf-8'))
+                raise RuntimeError('could not retrieve openid metadata, returned error: {}\n{}'.format(
+                    response.status_code, response.content.decode('utf-8')))
             content = response.content.decode('utf-8')
             meta = json.loads(content)
             # cache this metadata
@@ -438,6 +440,16 @@ class GlobusRedirectHandler(RedirectHandler):
         body = json.loads(response.content)
         tokens = []
         user = token = nonce = None
+
+        def create_uid(uid):
+            # only thing we have here is the subject id, so use sub id as the user_name too
+            logging.warn(('unrecognized user for Globus token response without an id_token field, ',
+                          'filling user_name with the same as the id'))
+            user = models.User.objects.create(
+                id=uid,
+                user_name=uid)
+            user.save()
+
         # check to see if top level token is for openid
         if 'openid' in body['scope'] and 'id_token' in body:
             # w_copy = deepcopy(w)
@@ -454,14 +466,7 @@ class GlobusRedirectHandler(RedirectHandler):
                 if len(users) > 0:
                     user = users[0]
                 else:
-                    # only thing we have here is the subject id, so use sub id as the user_name too
-                    user_name = w.uid
-                    print('unrecognized user for Globus token response without an id_token field,'
-                          + 'filling user_name with the same as the id')
-                    user = models.User.objects.create(
-                        id=w.uid,
-                        user_name=user_name)
-                    user.save()
+                    create_uid(w.uid)
             # For globus, on a token callback it also puts the state value into the root level
             # json object. This is actually pretty nice and should be part of the OAuth2.0 spec.
             # However substituting the state value for the nonce (in OAuth2 callbacks, not OIDC)
@@ -486,14 +491,7 @@ class GlobusRedirectHandler(RedirectHandler):
             if len(users) > 0:
                 user = users[0]
             else:
-                # only thing we have here is the subject id, so use sub id as the user_name too
-                user_name = w.uid
-                print('unrecognized user for Globus token response without an id_token field,'
-                      + 'filling user_name with the same as the id')
-                user = models.User.objects.create(
-                    id=w.uid,
-                    user_name=user_name)
-                user.save()
+                create_uid(w.uid)
 
         if 'other_tokens' in body and len(body['other_tokens']) > 0:
             for other_token in body['other_tokens']:
@@ -503,7 +501,7 @@ class GlobusRedirectHandler(RedirectHandler):
         return (True, '', user, tokens[0], nonce)
 
     def _handle_token_body(self, user, w, nonce, token_dict):
-        print('handling globus token body:\n' + str(token_dict))
+        logging.debug('handling globus token body: %s', token_dict)
         access_token = token_dict['access_token']
         expires_in = token_dict['expires_in']
         refresh_token = token_dict['refresh_token']
@@ -558,14 +556,14 @@ class Validator(object):
         response = requests.post(endpoint, headers=headers, data=body)
         content = response.content.decode('utf-8')
         if response.status_code > 400:
-            print('validate failed on {}. returned [{}] {}'.format(endpoint, response.status_code, content))
+            logging.error('validate failed on %s. returned [%s] %s', endpoint, response.status_code, content)
             return {'active': False}
         else:
             try:
                 body = json.loads(content)
-                print(body)
+                logging.debug('loaded body from json %s', body)
             except json.JSONDecodeError:
-                print('could not decode response: {}'.format(content))
+                logging.error('could not decode response: %s', content)
                 return {'active': False}
             if body.get('active', None):
                 r = {'active': True}
@@ -590,14 +588,14 @@ class GoogleValidator(Validator):
         response = requests.post(endpoint)
         content = response.content.decode('utf-8')
         if response.status_code > 400:
-            print('validate failed on {}. returned [{}] {}'.format(
-                endpoint, response.status_code, content))
+            logging.warn('validate failed on %s. returned [%s] %s',
+                         endpoint, response.status_code, content)
             return {'active': False}
         else:
             try:
                 body = json.loads(content)
             except json.JSONDecodeError:
-                print('could not decode response: {}'.format(content))
+                logging.warn('could not decode response: %s', content)
                 return {'active': False}
             if int(body['expires_in']) > 0:
                 r = {'active': True}
