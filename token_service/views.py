@@ -1,7 +1,6 @@
 import logging
 import re
 import time
-import logging
 from django.http import (
         HttpResponseBadRequest,
         JsonResponse,
@@ -480,7 +479,7 @@ def action_user_key(request, uid, key_id, **kwargs):
 
 
 @require_http_methods(['GET'])
-@require_valid_api_key # for this user key endpoint, only allow applications, not users
+@require_valid_api_key  # for this user key endpoint, only allow applications, not users
 def verify_user_key(request, **kwargs):
     key_param = request.GET.get('key')
     if not key_param:
@@ -518,4 +517,3 @@ def verify_user_key(request, **kwargs):
             return JsonResponse(status=200, data={'valid': True, 'uid': key.user.id, 'user_name': key.user.user_name})
     except ObjectDoesNotExist as e:
         return JsonResponse(status=401, data={'valid': False})
-
